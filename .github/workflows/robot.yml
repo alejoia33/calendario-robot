@@ -1,0 +1,227 @@
+# Robot del calendario de reservas (Airbnb ⇄ Booking 24/7).
+# Lo creó la app del calendario. No hace falta tocar nada aquí.
+name: Robot calendario
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: robot-calendario
+  cancel-in-progress: false
+jobs:
+  sincronizar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - name: Sincronizar Airbnb y Booking
+        env:
+          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
+        run: |
+          cat > robot.mjs <<'EOF'
+          // Robot del calendario de reservas: corre en GitHub Actions cada ~10 minutos, aunque el PC esté apagado.
+          // Lee los calendarios de Airbnb y Booking de cada depto. Si aparece una reserva que la app todavía no conoce,
+          // cierra esas fechas en el calendario que el OTRO canal importa (D{n}-airbnb.ics / D{n}-booking.ics del Gist).
+          // Todo lo demás (Directas, bloqueos, reservas movidas, salidas tardías) lo sigue decidiendo la app:
+          // la app deja en un Gist privado (robot.json) lo que publicó y las reservas que ya conoce.
+          // Los registros (logs) de GitHub son públicos si el repositorio es público: aquí solo se imprimen conteos.
+          const TOKEN = process.env.GIST_TOKEN;
+          const REBOTE_MS = 72 * 3600 * 1000;
+          const UA = 'Mozilla/5.0 CalendarioReservas-Robot';
+
+          async function gh(metodo, ruta, cuerpo) {
+              const r = await fetch('https://api.github.com' + ruta, {
+                  method: metodo,
+                  headers: { Authorization: `Bearer ${TOKEN}`, Accept: 'application/vnd.github+json', 'User-Agent': UA, ...(cuerpo ? { 'Content-Type': 'application/json' } : {}) },
+                  body: cuerpo ? JSON.stringify(cuerpo) : undefined
+              });
+              const t = await r.text();
+              if (!r.ok) throw new Error(`GitHub ${r.status} en ${metodo} ${ruta.split('?')[0].replace(/[0-9a-f]{20,}/g, '…')}`);
+              return t ? JSON.parse(t) : {};
+          }
+          async function contenidoArchivo(f) {
+              if (!f) return null;
+              if (!f.truncated) return f.content;
+              const r = await fetch(f.raw_url, { headers: { Authorization: `Bearer ${TOKEN}`, 'User-Agent': UA } });
+              return r.ok ? r.text() : null;
+          }
+          async function descargar(url) {
+              const ctl = new AbortController();
+              const t = setTimeout(() => ctl.abort(), 25000);
+              try {
+                  const r = await fetch(url, { headers: { 'User-Agent': UA, Accept: 'text/calendar,*/*' }, signal: ctl.signal, redirect: 'follow' });
+                  if (!r.ok) throw new Error('HTTP ' + r.status);
+                  const txt = await r.text();
+                  if (!/BEGIN:VCALENDAR/.test(txt)) throw new Error('no es un calendario');
+                  return txt;
+              } finally { clearTimeout(t); }
+          }
+
+          // ---------- fechas como 'YYYYMMDD' ----------
+          const aFecha = s => new Date(Date.UTC(+s.slice(0, 4), +s.slice(4, 6) - 1, +s.slice(6, 8)));
+          const aTexto = d => d.toISOString().slice(0, 10).replace(/-/g, '');
+          function noches(ci, co) {
+              const out = [];
+              for (let d = aFecha(ci); aTexto(d) < co; d.setUTCDate(d.getUTCDate() + 1)) out.push(aTexto(d));
+              return out;
+          }
+          function hoyChile() {
+              const p = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Santiago', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date());
+              return p.replace(/-/g, '');
+          }
+
+          function parsearIcal(texto) {
+              const lineas = texto.replace(/\r?\n[ \t]/g, '').split(/\r?\n/);
+              const eventos = [];
+              let ev = null;
+              for (const l of lineas) {
+                  if (l === 'BEGIN:VEVENT') ev = {};
+                  else if (l === 'END:VEVENT') { if (ev && ev.ci && ev.co) eventos.push(ev); ev = null; }
+                  else if (ev) {
+                      const i = l.indexOf(':');
+                      if (i < 0) continue;
+                      const clave = l.slice(0, i).split(';')[0].toUpperCase(), valor = l.slice(i + 1);
+                      if (clave === 'DTSTART') ev.ci = valor.slice(0, 8);
+                      else if (clave === 'DTEND') ev.co = valor.slice(0, 8);
+                      else if (clave === 'UID') ev.uid = valor.trim();
+                      else if (clave === 'SUMMARY') ev.titulo = valor;
+                  }
+              }
+              eventos.forEach(e => { if (!(e.co > e.ci)) { const d = aFecha(e.ci); d.setUTCDate(d.getUTCDate() + 1); e.co = aTexto(d); } });
+              return eventos;
+          }
+
+          // Igual que generarIcs() de la app, para que el archivo quede idéntico cuando no hay nada que agregar
+          function generarIcs(room, canal, bloques) {
+              const lineas = ['BEGIN:VCALENDAR', 'VERSION:2.0', 'PRODID:-//CalendarioReservas//ES', 'CALSCALE:GREGORIAN', 'METHOD:PUBLISH'];
+              bloques.forEach(([ci, co]) => {
+                  lineas.push('BEGIN:VEVENT', `UID:d${room}-${ci}-${co}-${canal}@calendarioreservas`, 'DTSTAMP:20260101T000000Z',
+                      `DTSTART;VALUE=DATE:${ci}`, `DTEND;VALUE=DATE:${co}`, 'SUMMARY:Ocupado', 'TRANSP:OPAQUE', 'END:VEVENT');
+              });
+              lineas.push('END:VCALENDAR');
+              return lineas.join('\r\n') + '\r\n';
+          }
+          function unir(rangos) {
+              const ord = rangos.map(r => [r[0], r[1]]).sort((a, b) => a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0);
+              const out = [];
+              for (const r of ord) {
+                  const u = out[out.length - 1];
+                  if (u && r[0] <= u[1]) { if (r[1] > u[1]) u[1] = r[1]; } else out.push(r);
+              }
+              return out;
+          }
+
+          export async function correr() {
+              if (!TOKEN) throw new Error('Falta el secreto GIST_TOKEN en el repositorio.');
+              // 1) Encontrar el Gist privado del robot (el que tiene robot.json)
+              let gistRobot = null;
+              for (let pag = 1; pag <= 5 && !gistRobot; pag++) {
+                  const lista = await gh('GET', `/gists?per_page=100&page=${pag}`);
+                  gistRobot = lista.filter(g => g.files && g.files['robot.json'])
+                      .sort((a, b) => (b.updated_at || '').localeCompare(a.updated_at || ''))[0] || null;
+                  if (lista.length < 100) break;
+              }
+              if (!gistRobot) { console.log('Todavía no hay robot.json: abre la app una vez para que lo publique.'); return { estado: 'sin-config' }; }
+              const robotFull = await gh('GET', `/gists/${gistRobot.id}`);
+              const cfg = JSON.parse(await contenidoArchivo(robotFull.files['robot.json']));
+              let estado = {};
+              try { estado = JSON.parse(await contenidoArchivo(robotFull.files['robot-estado.json']) || '{}'); } catch (e) { estado = {}; }
+              estado.exportados = estado.exportados || {};
+              estado.extrasPrevios = estado.extrasPrevios || {};
+
+              const ahora = Date.now(), hoy = hoyChile();
+              for (const k in estado.exportados) if (ahora - estado.exportados[k] > REBOTE_MS) delete estado.exportados[k];
+
+              const conocidos = { airbnb: new Set(cfg.conocidos?.airbnb || []), booking: new Set(cfg.conocidos?.booking || []) };
+              const extras = {};          // archivo → [[ci, co, origen]]
+              const errores = [];
+              const agregadas = [];
+
+              for (let d = 1; d <= (cfg.deptos || 15); d++) {
+                  for (const origen of ['airbnb', 'booking']) {
+                      const url = cfg.feeds?.[d]?.[origen];
+                      if (!url) continue;
+                      const destino = origen === 'airbnb' ? 'booking' : 'airbnb';
+                      const archivo = `D${d}-${destino}.ics`;
+                      const claveExtra = `${archivo}|${origen}`;
+                      let eventos;
+                      try { eventos = parsearIcal(await descargar(url)); }
+                      catch (e) {
+                          // Si un calendario no responde, se mantiene lo que el robot ya había cerrado por él
+                          errores.push(`D${d} ${origen}: ${e.name === 'AbortError' ? 'tiempo agotado' : e.message}`);
+                          (estado.extrasPrevios[claveExtra] || []).forEach(x => (extras[archivo] = extras[archivo] || []).push(x));
+                          continue;
+                      }
+                      const yaCerradas = new Set();
+                      (cfg.base?.[archivo] || []).forEach(([ci, co]) => noches(ci, co).forEach(n => yaCerradas.add(n)));
+                      // Anti-rebote: Booking devuelve como "CLOSED" las fechas que le mandamos. Esas no son reservas.
+                      const rebote = new Set();
+                      if (origen === 'booking') {
+                          (cfg.rebote?.[`booking|${d}`] || []).forEach(([ci, co]) => noches(ci, co).forEach(n => rebote.add(n)));
+                          (cfg.base?.[`D${d}-booking.ics`] || []).forEach(([ci, co]) => noches(ci, co).forEach(n => rebote.add(n)));
+                          for (const k in estado.exportados) {
+                              const [c, dd, ci, co] = k.split('|');
+                              if (c === 'booking' && +dd === d) noches(ci, co).forEach(n => rebote.add(n));
+                          }
+                      }
+                      const nuevos = [];
+                      for (const ev of eventos) {
+                          if (ev.co <= hoy) continue;
+                          if (origen === 'airbnb' && /not available|no disponible|blocked|bloquead/i.test(ev.titulo || '')) continue;
+                          if (ev.uid && conocidos[origen].has(ev.uid)) continue;     // la app ya la tiene: ella decide
+                          const ns = noches(ev.ci > hoy ? ev.ci : hoy, ev.co);
+                          if (!ns.length) continue;
+                          if (origen === 'booking' && ns.every(n => rebote.has(n))) continue;
+                          if (ns.every(n => yaCerradas.has(n))) continue;            // ya estaba cerrado
+                          nuevos.push([ev.ci, ev.co, origen]);
+                          agregadas.push({ depto: d, origen, ci: ev.ci, co: ev.co });
+                      }
+                      estado.extrasPrevios[claveExtra] = nuevos;
+                      nuevos.forEach(x => (extras[archivo] = extras[archivo] || []).push(x));
+                  }
+              }
+
+              // 2) Armar los archivos y escribir solo los que cambian
+              const gistExport = cfg.exportGistId ? await gh('GET', `/gists/${cfg.exportGistId}`) : null;
+              if (!gistExport) throw new Error('La app aún no ha publicado su calendario (falta el Gist de exportación).');
+              const cambios = {};
+              for (let d = 1; d <= (cfg.deptos || 15); d++) {
+                  for (const canal of ['booking', 'airbnb']) {
+                      const archivo = `D${d}-${canal}.ics`;
+                      if (!cfg.base || !(archivo in cfg.base)) continue;
+                      const bloques = unir([...(cfg.base[archivo] || []), ...(extras[archivo] || []).map(x => [x[0], x[1]])]);
+                      const contenido = generarIcs(d, canal, bloques);
+                      const actual = await contenidoArchivo(gistExport.files?.[archivo]);
+                      if (actual !== contenido) cambios[archivo] = { content: contenido };
+                      (extras[archivo] || []).forEach(x => { estado.exportados[`${canal}|${d}|${x[0]}|${x[1]}`] = ahora; });
+                  }
+              }
+              if (Object.keys(cambios).length) await gh('PATCH', `/gists/${cfg.exportGistId}`, { files: cambios });
+
+              // 3) Estado del robot (para que la app muestre qué hizo). Se escribe si cambió algo, o una vez por hora.
+              const firmaNueva = JSON.stringify({ agregadas, errores });
+              const ultima = Date.parse(estado.ultimaCorrida || 0) || 0;
+              const nuevoEstado = { ...estado, ultimaCorrida: new Date(ahora).toISOString(), agregadas, errores, configDe: cfg.generadoEn || null };
+              if (firmaNueva !== estado.firma || Object.keys(cambios).length || ahora - ultima > 55 * 60 * 1000) {
+                  nuevoEstado.firma = firmaNueva;
+                  await gh('PATCH', `/gists/${gistRobot.id}`, { files: { 'robot-estado.json': { content: JSON.stringify(nuevoEstado, null, 1) } } });
+              }
+              console.log(`Listo. Fechas nuevas cerradas: ${agregadas.length}. Archivos actualizados: ${Object.keys(cambios).length}. Calendarios con error: ${errores.length}.`);
+              return { estado: 'ok', agregadas, errores, cambios: Object.keys(cambios) };
+          }
+
+          if (process.argv[1] && process.argv[1].endsWith('robot.mjs')) {
+              correr().catch(e => { console.error('Error:', e.message); process.exit(1); });
+          }
+
+          EOF
+          node robot.mjs
+      - name: Mantener activo (GitHub pausa los robots sin actividad por 60 días)
+        if: always()
+        run: |
+          if [ "$(date -u +%d%H%M | cut -c1-4)" = "0103" ]; then
+            git clone -q --depth 1 "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" repo && cd repo
+            git config user.name "robot-calendario" && git config user.email "robot@calendario.local"
+            date -u > .ultima-actividad && git add .ultima-actividad && git commit -qm "robot activo" && git push -q || true
+          fi
