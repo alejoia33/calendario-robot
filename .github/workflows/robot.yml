@@ -134,6 +134,8 @@ jobs:
               for (const k in estado.exportados) if (ahora - estado.exportados[k] > REBOTE_MS) delete estado.exportados[k];
 
               const conocidos = { airbnb: new Set(cfg.conocidos?.airbnb || []), booking: new Set(cfg.conocidos?.booking || []) };
+              const leidosBooking = {};   // depto → eventos del iCal de Booking (solo los que se pudieron leer)
+              let fallosBooking = 0;
               const extras = {};          // archivo → [[ci, co, origen]]
               const errores = [];
               const agregadas = [];
@@ -150,9 +152,11 @@ jobs:
                       catch (e) {
                           // Si un calendario no responde, se mantiene lo que el robot ya había cerrado por él
                           errores.push(`D${d} ${origen}: ${e.name === 'AbortError' ? 'tiempo agotado' : e.message}`);
+                          if (origen === 'booking') fallosBooking++;
                           (estado.extrasPrevios[claveExtra] || []).forEach(x => (extras[archivo] = extras[archivo] || []).push(x));
                           continue;
                       }
+                      if (origen === 'booking') leidosBooking[d] = eventos;
                       const yaCerradas = new Set();
                       (cfg.base?.[archivo] || []).forEach(([ci, co]) => noches(ci, co).forEach(n => yaCerradas.add(n)));
                       // Anti-rebote: Booking devuelve como "CLOSED" las fechas que le mandamos. Esas no son reservas.
@@ -182,6 +186,46 @@ jobs:
                   }
               }
 
+              // 1b) Reservas de Booking que desaparecieron de su iCal (cancelación) con la app cerrada:
+              //     se reabren sus noches en Airbnb. Si la app está abierta (avisó hace menos de 75 min), decide ella.
+              //     Resguardos: se leyeron TODOS los iCal de Booking; el UID no está en ninguno (por si se movió de depto);
+              //     ninguna otra cosa ocupa esas noches en el iCal de Booking; sigue faltando en dos revisiones seguidas;
+              //     y si desaparecen más de 3 de un mismo depto a la vez, no se toca nada (probable falla de Booking).
+              const liberadas = [];
+              const ausentesPrev = estado.ausentes || {}, ausentes = {};
+              const appActiva = cfg.generadoEn && ahora - Date.parse(cfg.generadoEn) < 75 * 60 * 1000;
+              const base = {};
+              for (const a in (cfg.base || {})) base[a] = (cfg.base[a] || []).map(x => [x[0], x[1]]);
+              if (fallosBooking) Object.assign(ausentes, ausentesPrev);          // sin datos completos: no se decide nada
+              else {
+                  const uidsBooking = new Set();
+                  Object.values(leidosBooking).forEach(evs => evs.forEach(e => e.uid && uidsBooking.add(e.uid)));
+                  const porFeed = {};
+                  for (const x of (cfg.bookingEnAirbnb || [])) {
+                      if (!x || !x.uid || !(x.feed in leidosBooking) || !x.bloques?.length || !(x.bloques[0][0] > hoy)) continue;
+                      if (uidsBooking.has(x.uid)) continue;
+                      const ns = noches(x.bloques[0][0], x.bloques[0][1]);
+                      if (leidosBooking[x.feed].some(e => noches(e.ci, e.co).some(n => ns.includes(n)))) continue;
+                      (porFeed[x.feed] = porFeed[x.feed] || []).push(x);
+                  }
+                  for (const f in porFeed) {
+                      if (porFeed[f].length > 3) { errores.push(`D${f} booking: ${porFeed[f].length} reservas desaparecieron a la vez; no se reabrió nada`); continue; }
+                      for (const x of porFeed[f]) {
+                          ausentes[x.uid] = ausentesPrev[x.uid] || ahora;
+                          if (appActiva || ahora - ausentes[x.uid] < 8 * 60 * 1000) continue;
+                          const lista = base[x.archivo];
+                          if (!lista) continue;
+                          let quito = false;
+                          x.bloques.forEach(([ci, co]) => {
+                              const i = lista.findIndex(b => b[0] === ci && b[1] === co);
+                              if (i >= 0) { lista.splice(i, 1); quito = true; }
+                          });
+                          if (quito) liberadas.push({ depto: x.depto, ci: x.bloques[0][0], co: x.bloques[0][1] });
+                      }
+                  }
+              }
+              estado.ausentes = ausentes;
+
               // 2) Armar los archivos y escribir solo los que cambian
               const gistExport = cfg.exportGistId ? await gh('GET', `/gists/${cfg.exportGistId}`) : null;
               if (!gistExport) throw new Error('La app aún no ha publicado su calendario (falta el Gist de exportación).');
@@ -190,7 +234,7 @@ jobs:
                   for (const canal of ['booking', 'airbnb']) {
                       const archivo = `D${d}-${canal}.ics`;
                       if (!cfg.base || !(archivo in cfg.base)) continue;
-                      const bloques = unir([...(cfg.base[archivo] || []), ...(extras[archivo] || []).map(x => [x[0], x[1]])]);
+                      const bloques = unir([...(base[archivo] || []), ...(extras[archivo] || []).map(x => [x[0], x[1]])]);
                       const contenido = generarIcs(d, canal, bloques);
                       const actual = await contenidoArchivo(gistExport.files?.[archivo]);
                       if (actual !== contenido) cambios[archivo] = { content: contenido };
@@ -200,15 +244,15 @@ jobs:
               if (Object.keys(cambios).length) await gh('PATCH', `/gists/${cfg.exportGistId}`, { files: cambios });
 
               // 3) Estado del robot (para que la app muestre qué hizo). Se escribe si cambió algo, o una vez por hora.
-              const firmaNueva = JSON.stringify({ agregadas, errores });
+              const firmaNueva = JSON.stringify({ agregadas, liberadas, errores });
               const ultima = Date.parse(estado.ultimaCorrida || 0) || 0;
-              const nuevoEstado = { ...estado, ultimaCorrida: new Date(ahora).toISOString(), agregadas, errores, configDe: cfg.generadoEn || null };
+              const nuevoEstado = { ...estado, ultimaCorrida: new Date(ahora).toISOString(), agregadas, liberadas, errores, configDe: cfg.generadoEn || null };
               if (firmaNueva !== estado.firma || Object.keys(cambios).length || ahora - ultima > 55 * 60 * 1000) {
                   nuevoEstado.firma = firmaNueva;
                   await gh('PATCH', `/gists/${gistRobot.id}`, { files: { 'robot-estado.json': { content: JSON.stringify(nuevoEstado, null, 1) } } });
               }
-              console.log(`Listo. Fechas nuevas cerradas: ${agregadas.length}. Archivos actualizados: ${Object.keys(cambios).length}. Calendarios con error: ${errores.length}.`);
-              return { estado: 'ok', agregadas, errores, cambios: Object.keys(cambios) };
+              console.log(`Listo. Fechas nuevas cerradas: ${agregadas.length}. Reabiertas por cancelación: ${liberadas.length}. Archivos actualizados: ${Object.keys(cambios).length}. Calendarios con error: ${errores.length}.`);
+              return { estado: 'ok', agregadas, liberadas, errores, cambios: Object.keys(cambios) };
           }
 
           if (process.argv[1] && process.argv[1].endsWith('robot.mjs')) {
