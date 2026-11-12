@@ -7,13 +7,16 @@ on:
   workflow_dispatch:
 permissions:
   contents: write
+  actions: write
 concurrency:
   group: robot-calendario
   cancel-in-progress: false
+# GitHub atrasa mucho los horarios automáticos (a veces corre cada 6 h en vez de cada 10 min).
+# Por eso cada corrida queda trabajando ~5 h 40 min revisando cada 10 min, y al terminar se relanza sola.
 jobs:
   sincronizar:
     runs-on: ubuntu-latest
-    timeout-minutes: 6
+    timeout-minutes: 355
     steps:
       - name: Sincronizar Airbnb y Booking
         env:
@@ -260,7 +263,19 @@ jobs:
           }
 
           EOF
-          node robot.mjs
+          fin=$((SECONDS + 340*60))
+          vuelta=0
+          while [ $SECONDS -lt $fin ]; do
+            vuelta=$((vuelta+1))
+            echo "--- Revisión $vuelta ($(date -u +%H:%M) UTC)"
+            node robot.mjs || echo "Esta revisión falló; se reintenta en 10 minutos."
+            sleep 600
+          done
+      - name: Relanzar el robot (para que siga 24/7)
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run robot.yml --repo "${{ github.repository }}" --ref "${{ github.ref_name }}" || echo "No se pudo relanzar; lo retoma el horario automático."
       - name: Mantener activo (GitHub pausa los robots sin actividad por 60 días)
         if: always()
         run: |
